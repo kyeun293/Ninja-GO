@@ -50,6 +50,7 @@ Got-Hands/
 └── .vscode/
 ```
 
+
 ## 실행 방법
 
 빌드 과정이 없어 정적 파일 서버만 있으면 됩니다. 단, 웹캠(`getUserMedia`)은 보안 컨텍스트(HTTPS 또는 `localhost`)에서만 동작하므로 `web/index.html`을 파일로 직접 열지 말고 반드시 로컬 서버로 띄워야 합니다.
@@ -59,6 +60,9 @@ cd web
 python3 -m http.server 8080
 # 브라우저에서 http://localhost:8080 접속 후 카메라 권한 허용
 ```
+학습이 끝나면 ml/models/handseal.onnx가 생성되고 web/models/에 자동으로 복사됩니다. 새로고침하면 바로 반영됩니다.
+
+
 
 ## 조작 방법
 

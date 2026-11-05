@@ -85,8 +85,8 @@ export class GestureClassifier {
     const lWrist = tip(l, 0);
     const wristDist = Math.hypot(rWrist.x - lWrist.x, rWrist.y - lWrist.y);
 
-    // 돼지(亥)
-    const isBoar = wristDist < 0.25 &&
+    // 돼지(亥) — wristDist는 이제 오른손 크기 단위 (스케일 정규화 후)
+    const isBoar = wristDist < 1.0 &&
       down(r,8,6) && down(r,12,10) && down(r,16,14) && down(r,20,18) &&
       down(l,8,6) && down(l,12,10) && down(l,16,14) && down(l,20,18);
 
