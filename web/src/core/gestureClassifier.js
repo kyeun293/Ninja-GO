@@ -3,17 +3,40 @@ export class GestureClassifier {
     this._lastJutsu = 'none';
     this._lastSeen  = 0;
     this.HOLD_MS    = 300;
+    this.labels     = null;
+    this.hasModel   = false;
   }
 
   async loadModel() {
     try {
-      this.model = await ort.InferenceSession.create('/models/handseal.onnx');
-      const res = await fetch('/models/labels.json');
-      this.labels = await res.json();
+      this.ort = window.ort;
+      if (!this.ort) throw new Error('window.ort가 없음');
+
+      const [session, labelsRes] = await Promise.all([
+        this.ort.InferenceSession.create('models/handseal.onnx'),
+        fetch('models/labels.json'),
+      ]);
+      this.model    = session;
+      this.labels   = await labelsRes.json();
       this.hasModel = true;
-    } catch {
+    } catch (e) {
+      console.error('[GestureClassifier] loadModel 실패:', e);
       this.hasModel = false;
     }
+  }
+
+  // 게임 루프 전용 동기 경로 (모델 없을 때 — 항상 이 경로 사용)
+  predictSync(normalized) {
+    const result = this._predictRules(normalized);
+    if (result.jutsu !== 'none') {
+      this._lastJutsu = result.jutsu;
+      this._lastSeen  = Date.now();
+      return result;
+    }
+    if (Date.now() - this._lastSeen < this.HOLD_MS) {
+      return { jutsu: this._lastJutsu, confidence: 50 };
+    }
+    return result;
   }
 
   async predict(normalized) {
@@ -35,7 +58,8 @@ export class GestureClassifier {
     const input = new Float32Array(126);
     if (normalized.right) input.set(normalized.right, 0);
     if (normalized.left)  input.set(normalized.left,  63);
-    const tensor = new ort.Tensor('float32', input, [1, 126]);
+
+    const tensor = new this.ort.Tensor('float32', input, [1, 126]);
     const out    = await this.model.run({ input: tensor });
     const logits = Array.from(out.output.data);
     const maxL   = Math.max(...logits);

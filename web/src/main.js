@@ -1,22 +1,18 @@
-import { FilesetResolver, HandLandmarker, FaceLandmarker }
+import { FilesetResolver, HandLandmarker }
   from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/vision_bundle.js';
 
 import { GestureClassifier } from './core/gestureClassifier.js';
+import { normalize }         from './core/normalize.js';
 import { UIController }      from './ui/uiController.js';
-import { DataCollector }     from './core/dataCollector.js';
-import { AREffectEngine }    from './effects/arEffectEngine.js';
-
-const state = { mode: 'demo', currentJutsu: 'none' };
+import { SceneManager }      from './game/SceneManager.js';
+import { OnboardingScene }   from './game/scenes/OnboardingScene.js';
 
 const video  = document.getElementById('input-video');
 const canvas = document.getElementById('main-canvas');
 const ctx    = canvas.getContext('2d');
 
-const ui        = new UIController(state);
-const classifier = new GestureClassifier();
-const arFx      = new AREffectEngine(canvas, ctx);
-const collector = new DataCollector(onCollectorState);
-window._collector = collector;
+let devMode = false;
+let masterKeyDown = false;
 
 function resizeCanvas() {
   canvas.width  = window.innerWidth;
@@ -25,69 +21,37 @@ function resizeCanvas() {
 resizeCanvas();
 window.addEventListener('resize', resizeCanvas);
 
-// ml/train.py normalize_landmarks()와 반드시 동일 로직 유지
-function normalize(landmarks, handednessList) {
-  const result = { right: null, left: null };
-  if (!landmarks) return result;
+async function init() {
+  await document.fonts.ready;
+  const devOverlay = document.getElementById('dev-overlay');
 
-  const raw = { right: null, left: null };
-  landmarks.forEach((lms, idx) => {
-    const label = handednessList?.[idx]?.[0]?.categoryName;
-    // Tasks API: 미러링 카메라 기준 Left/Right 반전 없음
-    const side  = label === 'Left' ? 'right' : 'left';
-    raw[side] = lms;
+  document.addEventListener('keydown', e => {
+    if (e.key === '`') {
+      devMode = !devMode;
+      devOverlay.classList.toggle('hidden', !devMode);
+    } else if (e.key === 'r' || e.key === 'R') {
+      masterKeyDown = true;
+    }
+  });
+  document.addEventListener('keyup', e => {
+    if (e.key === 'r' || e.key === 'R') {
+      masterKeyDown = false;
+    }
   });
 
-  const rWrist  = raw.right ? raw.right[0] : null;
-  const lWrist  = raw.left  ? raw.left[0]  : null;
-  const lAnchor = rWrist ?? lWrist; // 오른손 있으면 오른손 wrist 기준, 없으면 왼손 wrist 기준
-
-  // scale: 오른손 wrist → 오른손 중지 MCP(9) 거리 (xy). 오른손 없으면 1.0
-  let scale = 1.0;
-  if (raw.right) {
-    const d = Math.hypot(raw.right[9].x - rWrist.x, raw.right[9].y - rWrist.y);
-    if (d !== 0) scale = d;
-  }
-
-  if (raw.right) {
-    const arr = new Float32Array(63);
-    raw.right.forEach((lm, i) => {
-      arr[i*3]   = (lm.x - rWrist.x) / scale;
-      arr[i*3+1] = (lm.y - rWrist.y) / scale;
-      arr[i*3+2] = (lm.z - rWrist.z) / scale;
-    });
-    result.right = arr;
-  }
-
-  if (raw.left) {
-    const arr = new Float32Array(63);
-    raw.left.forEach((lm, i) => {
-      arr[i*3]   = (lm.x - lAnchor.x) / scale;
-      arr[i*3+1] = (lm.y - lAnchor.y) / scale;
-      arr[i*3+2] = (lm.z - lAnchor.z) / scale;
-    });
-    result.left = arr;
-  }
-
-  return result;
-}
-
-async function init() {
+  const ui = new UIController({});
   ui.setStatus('loading', 'MediaPipe 로딩중...');
 
-  // 카메라 스트림
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { width: 1280, height: 720, facingMode: 'user' }
   });
   video.srcObject = stream;
   await new Promise(res => { video.onloadedmetadata = () => video.play().then(res); });
 
-  // Tasks Vision WASM 로드
   const vision = await FilesetResolver.forVisionTasks(
     'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm'
   );
 
-  // HandLandmarker 초기화
   const handLandmarker = await HandLandmarker.createFromOptions(vision, {
     baseOptions: {
       modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
@@ -100,141 +64,125 @@ async function init() {
     minTrackingConfidence: 0.3,
   });
 
-  // FaceLandmarker 초기화 (사륜안용)
-  const faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
-    baseOptions: {
-      modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-      delegate: 'GPU',
-    },
-    runningMode: 'VIDEO',
-    numFaces: 1,
-  });
-
+  const classifier = new GestureClassifier();
   classifier.loadModel().catch(() => {});
-  setupCollectUI();
   ui.setStatus('active', '실행중');
 
-  // ── 메인 루프 ──────────────────────────────────────
-  let lastTime = -1;
+  const scenes = new SceneManager(canvas, ctx, video);
+  scenes.goto(OnboardingScene);
 
-  async function loop() {
+  let lastTime = performance.now();
+
+  const fpsEl       = document.getElementById('fps-counter');
+  const FPS_SAMPLES = 60;
+  const fpsTimes    = [];
+  let fpsDisplay    = 0;
+
+  function updateFPS(now) {
+    fpsTimes.push(now);
+    if (fpsTimes.length > FPS_SAMPLES) fpsTimes.shift();
+    if (fpsTimes.length < 2) return;
+    const fps = Math.round((fpsTimes.length - 1) / (fpsTimes[fpsTimes.length - 1] - fpsTimes[0]) * 1000);
+    if (fps !== fpsDisplay) {
+      fpsDisplay = fps;
+      fpsEl.textContent = `${fps} FPS  det:${Math.round(_detectMs)}ms`;
+      fpsEl.className = fps >= 50 ? 'fps-high' : fps >= 30 ? 'fps-mid' : 'fps-low';
+    }
+  }
+
+  let _devLastState  = { jutsu: 'none', confidence: 0 };
+  let _devPredicting = false;
+
+  let _gameLastJutsu  = 'none';
+  let _gamePredicting = false;
+
+  const _detectCanvas = document.createElement('canvas');
+  _detectCanvas.width  = 640;
+  _detectCanvas.height = 360;
+  const _detectCtx = _detectCanvas.getContext('2d');
+
+  let _lastDetectMs = 0;
+  let _cachedHands  = { landmarks: [], handednesses: [] };
+  let _detectMs     = 0;
+  const DETECT_EVERY = 50;
+
+  function loop() {
     requestAnimationFrame(loop);
-
     if (video.readyState < 2) return;
+
     const now = performance.now();
-    if (now === lastTime) return;
-    lastTime = now;
+    const dt  = Math.min(now - lastTime, 100);
+    lastTime  = now;
+    updateFPS(now);
 
-    // 손 감지
-    const handResult = handLandmarker.detectForVideo(video, now);
-    const landmarks  = handResult.landmarks;
-    const handedness = handResult.handednesses;
+    if (now - _lastDetectMs >= DETECT_EVERY) {
+      _lastDetectMs = now;
+      _detectCtx.drawImage(video, 0, 0, 640, 360);
+      const t0 = performance.now();
+      _cachedHands = handLandmarker.detectForVideo(_detectCanvas, now);
+      _detectMs    = performance.now() - t0;
+    }
+    const { landmarks, handednesses } = _cachedHands;
+    const normalized = normalize(landmarks, handednesses);
 
-    const normalized = normalize(landmarks, handedness);
-
-    if (state.mode === 'collect') {
-      collector.setLandmarks(landmarks, handedness);  // raw 전달 — 정규화는 train.py에서
-      arFx.draw('none', landmarks?.length ? landmarks : null, video);
-      return;
+    if (devMode) {
+      if (!landmarks?.length) {
+        _devLastState = { jutsu: 'none', confidence: 0 };
+      } else if (!_devPredicting) {
+        _devPredicting = true;
+        classifier.predict(normalized).then(result => {
+          _devLastState  = result;
+          _devPredicting = false;
+        });
+      }
+      ui.setJutsu(_devLastState.jutsu);
+      ui.setConfidence(_devLastState.confidence);
     }
 
-    if (!landmarks?.length) {
-      arFx.draw('none', null, video);
-      ui.setJutsu('none');
-      ui.setConfidence(0);
-      return;
+    const handState = { gesture: 'none', confidence: 0, landmarks, handednesses, normalized, masterKey: masterKeyDown };
+    if (landmarks?.length) {
+      if (classifier.hasModel) {
+        if (!_gamePredicting) {
+          _gamePredicting = true;
+          classifier.predict(normalized).then(r => {
+            _gameLastJutsu  = r.jutsu;
+            _gamePredicting = false;
+          });
+        }
+        handState.gesture    = _gameLastJutsu;
+        handState.confidence = _gameLastJutsu !== 'none' ? 72 : 0;
+      } else {
+        const { jutsu, confidence } = classifier.predictSync(normalized);
+        handState.gesture    = jutsu;
+        handState.confidence = confidence;
+      }
     }
 
-    const { jutsu, confidence } = await classifier.predict(normalized);
-    state.currentJutsu = jutsu;
-    ui.setJutsu(jutsu);
-    ui.setConfidence(confidence);
+    const hideScore = scenes.hideScoreHUD;
+    _scoreEl.parentElement.style.display = hideScore ? 'none' : '';
+    if (!hideScore) updateScoreHUD(scenes.score);
 
-    // 사륜안이면 얼굴도 감지
-    let faceLms = null;
-    if (jutsu === 'sharingan') {
-      const faceResult = faceLandmarker.detectForVideo(video, now);
-      faceLms = faceResult.faceLandmarks?.[0] ?? null;
-      arFx.updateFace(faceLms);
-    }
-
-    arFx.draw(jutsu, landmarks, video);
+    scenes.update(dt, handState);
+    scenes.render(handState);
   }
 
   loop();
 }
 
-// ── 수집 모드 UI ─────────────────────────────────────
-function setupCollectUI() {
-  let selectedJutsu = null;
-  document.querySelectorAll('.jutsu-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.jutsu-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      selectedJutsu = btn.dataset.jutsu;
-      document.getElementById('collect-jutsu').textContent = `술식: ${selectedJutsu}`;
-      document.getElementById('record-btn').disabled = false;
-      document.getElementById('record-btn-text').textContent = '녹화 시작';
-    });
-  });
-  document.getElementById('record-btn').addEventListener('click', () => {
-    const cd = parseInt(document.getElementById('cfg-countdown').value) || 3;
-    const dr = parseInt(document.getElementById('cfg-duration').value)  || 3;
-    collector.COUNTDOWN_SEC      = cd;
-    collector.RECORD_DURATION_MS = dr * 1000;
-    collector.startRecording(selectedJutsu);
-  });
-  document.getElementById('save-btn').addEventListener('click', () => collector.exportCSV());
+// ── SCORE HUD ─────────────────────────────────────────────────
+const _scoreEl = document.getElementById('score-value');
+let _dispScore = 0;
 
-  document.getElementById('undo-btn').addEventListener('click', () => {
-    const removed = collector.undo();
-    if (removed > 0) {
-      document.getElementById('collect-count').textContent = `총 수집: ${collector.count}개`;
-      document.getElementById('done-msg').textContent = `${removed}프레임 삭제됨 (누적 ${collector.count}개)`;
-      const toast = document.getElementById('done-toast');
-      toast.classList.add('visible');
-      setTimeout(() => toast.classList.remove('visible'), 2500);
-    }
-  });
-}
-
-function onCollectorState({ phase, remaining, captured, count }) {
-  const overlay   = document.getElementById('countdown-overlay');
-  const recInd    = document.getElementById('record-indicator');
-  const toast     = document.getElementById('done-toast');
-  const recordBtn = document.getElementById('record-btn');
-  const btnText   = document.getElementById('record-btn-text');
-  document.getElementById('collect-count').textContent = `총 수집: ${count}개`;
-
-  if (phase === 'countdown') {
-    overlay.classList.add('visible');
-    document.getElementById('countdown-number').textContent = remaining;
-    recordBtn.disabled = true; btnText.textContent = `${remaining}초...`;
-  } else if (phase === 'recording') {
-    overlay.classList.remove('visible');
-    recInd.classList.add('visible');
-    recordBtn.classList.add('recording'); recordBtn.disabled = true; btnText.textContent = '녹화 중...';
-  } else if (phase === 'done') {
-    recInd.classList.remove('visible');
-    recordBtn.classList.remove('recording'); recordBtn.disabled = false; btnText.textContent = '다시 녹화';
-    document.getElementById('done-msg').textContent = `${captured}프레임 수집 완료 (누적 ${count}개)`;
-    toast.classList.add('visible');
-    setTimeout(() => toast.classList.remove('visible'), 2500);
-  } else {
-    overlay.classList.remove('visible'); recInd.classList.remove('visible');
+function updateScoreHUD(targetScore) {
+  if (_dispScore < targetScore) {
+    const step = Math.max(10, Math.ceil((targetScore - _dispScore) / 12));
+    _dispScore = Math.min(targetScore, _dispScore + step);
+  } else if (_dispScore > targetScore) {
+    _dispScore = targetScore;
   }
+  _scoreEl.textContent = String(_dispScore).padStart(6, '0');
 }
-
-document.querySelectorAll('.mode-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    state.mode = btn.dataset.mode;
-    ui.onModeChange(state.mode);
-  });
-});
 
 init().catch(err => {
   console.error('[HANDSEAL]', err);
-  ui.setStatus('error', '오류: ' + err.message);
 });
